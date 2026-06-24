@@ -3,17 +3,15 @@
 """
 ==================================================================
   VIGÍA DE TURNOS - Licencia de conducir Rosario (psicofísico)
-  Login automático (CUIT + contraseña). Sirve para:
-    - Correr en bucle en tu compu/servidor (revisa cada N min).
-    - Correr UNA pasada por vez en GitHub Actions (variable RUN_ONCE=1).
+  Login automático (CUIT + contraseña) + modo diagnóstico.
 ==================================================================
 
-Lee el desplegable "Lugar de atención" de la pantalla "Modificar turno",
-saca la fecha de cada distrito que te interese y, si alguna es MÁS TEMPRANA
-que tu turno actual, manda un mail:  TURNO TURNO TURNO (dd/mm/aaaa)
+Lee el desplegable "Lugar de atención" de "Modificar turno", saca la fecha
+de cada distrito que te interese y, si alguna es MÁS TEMPRANA que tu turno
+actual, manda un mail:  TURNO TURNO TURNO (dd/mm/aaaa)
 
-Las credenciales SE LEEN DE VARIABLES DE ENTORNO (nunca van en el código):
-    MR_CUIT, MR_PASS, MR_MAIL_PASS
+Credenciales por variables de entorno: MR_CUIT, MR_PASS, MR_MAIL_PASS
+Si algo falla, guarda debug.png y debug.html para ver qué pasó.
 ==================================================================
 """
 
@@ -28,7 +26,7 @@ from playwright.sync_api import sync_playwright
 
 # ========================= CONFIG =========================
 
-FECHA_OBJETIVO = dt.date(2026, 8, 10)   # tu turno actual: avisar solo si hay algo ANTES
+FECHA_OBJETIVO = dt.date(2026, 8, 10)
 
 DISTRITOS_ACEPTADOS = {
     "CMD Sudoeste",
@@ -38,12 +36,9 @@ DISTRITOS_ACEPTADOS = {
 }
 
 INTERVALO_MIN = 5
-HEADLESS = True            # en la nube SIEMPRE True; en tu compu ponelo en False para ver
-
-# Una sola pasada (lo activa GitHub con RUN_ONCE=1). Vacío = bucle infinito.
+HEADLESS = True
 RUN_ONCE = bool(os.environ.get("RUN_ONCE"))
 
-# Credenciales (de variables de entorno)
 CUIT     = os.environ.get("MR_CUIT", "")
 PASSWORD = os.environ.get("MR_PASS", "")
 EMAIL_APP_PASSWORD = os.environ.get("MR_MAIL_PASS", "")
@@ -77,6 +72,16 @@ def enviar_mail(fecha, distrito):
         s.send_message(msg)
 
 
+def volcar_debug(page, etiqueta="debug"):
+    try:
+        page.screenshot(path=f"{etiqueta}.png", full_page=True)
+        with open(f"{etiqueta}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+        print(f"Guardé {etiqueta}.png y {etiqueta}.html (URL: {page.url})")
+    except Exception as e:
+        print("No pude guardar el diagnóstico:", e)
+
+
 def hay_pantalla_turnos(page):
     try:
         page.get_by_label("Lugar de atención").wait_for(timeout=6000)
@@ -85,8 +90,37 @@ def hay_pantalla_turnos(page):
         return False
 
 
+def campo_login_visible(page):
+    try:
+        return page.locator("#username").first.is_visible()
+    except Exception:
+        return False
+
+
+def intentar_revelar_login(page):
+    """Si el formulario de CUIT está oculto, clickea los botones para mostrarlo."""
+    candidatos = ["Municipalidad de Rosario", "Ingresar", "Iniciar sesión", "Acceder"]
+    for _ in range(3):
+        if campo_login_visible(page):
+            return
+        clickeo = False
+        for texto in candidatos:
+            try:
+                loc = page.get_by_text(texto, exact=False).first
+                if loc.count() > 0 and loc.is_visible():
+                    loc.click(timeout=4000)
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                    clickeo = True
+                    break
+            except Exception:
+                continue
+        if not clickeo:
+            return
+
+
 def login(page):
-    page.wait_for_selector("#username", timeout=20000)
+    intentar_revelar_login(page)
+    page.wait_for_selector("#username", state="visible", timeout=20000)
     page.fill("#username", CUIT)
     page.fill("#password", PASSWORD)
     page.click("#kc-login")
@@ -97,15 +131,8 @@ def asegurar_sesion(page):
     page.goto(URL_AGENDA, wait_until="networkidle", timeout=60000)
     if hay_pantalla_turnos(page):
         return
-    if page.locator("#username").count() == 0:
-        try:
-            page.get_by_text("Municipalidad de Rosario").first.click(timeout=8000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-        except Exception:
-            pass
-    if page.locator("#username").count() > 0:
-        login(page)
-        page.goto(URL_AGENDA, wait_until="networkidle", timeout=60000)
+    login(page)
+    page.goto(URL_AGENDA, wait_until="networkidle", timeout=60000)
     page.get_by_label("Lugar de atención").wait_for(timeout=20000)
 
 
@@ -137,7 +164,6 @@ def mejor_fecha(textos):
 
 
 def chequear_y_avisar(page, ultima_alerta):
-    """Una revisión. Devuelve la fecha alertada (o ultima_alerta sin cambios)."""
     ahora = dt.datetime.now().strftime("%d/%m %H:%M:%S")
     page.goto(URL_AGENDA, wait_until="networkidle", timeout=60000)
     if not hay_pantalla_turnos(page):
@@ -173,8 +199,13 @@ def main():
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             if RUN_ONCE:
-                asegurar_sesion(page)
-                chequear_y_avisar(page, None)
+                try:
+                    asegurar_sesion(page)
+                    chequear_y_avisar(page, None)
+                except Exception as e:
+                    print("FALLO:", e)
+                    volcar_debug(page)
+                    raise
             else:
                 print(f"Vigía en bucle. Aviso si hay turno antes del "
                       f"{FECHA_OBJETIVO:%d/%m/%Y}. (Ctrl+C para frenar)\n")
@@ -185,6 +216,7 @@ def main():
                         ultima = chequear_y_avisar(page, ultima)
                     except Exception as e:
                         print("error:", e)
+                        volcar_debug(page)
                     time.sleep(max(60, INTERVALO_MIN * 60 + random.randint(-20, 20)))
         except KeyboardInterrupt:
             print("\nFrenado.")
